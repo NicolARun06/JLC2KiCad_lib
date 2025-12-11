@@ -1,6 +1,5 @@
-name: Auto Build & Sync (Robust Version)
+name: Auto Build & Sync (Strict Versioning)
 
-# 授予写权限
 permissions:
   contents: write
 
@@ -13,7 +12,7 @@ on:
 
 jobs:
   # ===================================================
-  # 任务一：看门人 (智能判断 + 完整性检查)
+  # 任务一：看门人 (历史版本回溯 + 完整性检查)
   # ===================================================
   check_condition:
     runs-on: ubuntu-latest
@@ -25,73 +24,82 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0 
+          fetch-depth: 100 # 【关键】拉取足够深的历史，以便回溯版本号
 
       - name: Analyze Condition
         id: analyze
         shell: bash
         run: |
-          # 初始化默认状态
-          SHOULD_BUILD="false"
-          ver_num="none"
+          # --- 函数：从历史记录中提取最近的版本号 ---
+          function get_last_version() {
+            # 在最近 100 条提交中搜索符合 "version X -> Y" 格式的记录
+            # grep 提取版本号 Y
+            local ver=$(git log -n 100 --pretty=%B | grep -oP "version\s+[0-9.]+\s+->\s+\K[0-9.]+" | head -n 1)
+            
+            if [[ -z "$ver" ]]; then
+              echo "0.0.0" # 兜底，如果实在找不到
+            else
+              echo "$ver"
+            fi
+          }
 
-          # --- 1. 检查 GitHub 远程分支及文件完整性 ---
+          # --- 1. 获取基准版本号 (无论如何都要有一个版本号) ---
+          MSG=$(git log -1 --pretty=%B)
+          echo "Current Commit: $MSG"
+          REGEX="version\s+[0-9.]+\s+->\s+([0-9.]+)"
+          
+          if [[ "$MSG" =~ $REGEX ]]; then
+             # 如果当前提交就是发版，直接用
+             CURRENT_VER="${BASH_REMATCH[1]}"
+             echo "🎯 Detected NEW release in current commit: $CURRENT_VER"
+          else
+             # 如果当前不是发版，回溯历史找最近的一个
+             CURRENT_VER=$(get_last_version)
+             echo "🔙 Traceback found last version: $CURRENT_VER"
+          fi
+
+          # --- 2. 检查 GitHub 远程分支及文件完整性 ---
           echo "🔍 Checking remote branch status..."
           
-          # 尝试获取 binaries 分支的信息
           if git fetch origin binaries; then
-            echo "✅ Branch 'binaries' exists."
-            
-            # 检查关键文件是否存在 (JLC2KiCadLib_windows.exe 和 version.txt)
-            # git ls-tree 可以不切换分支直接查看内容
             if git ls-tree -r origin/binaries | grep -q "JLC2KiCadLib_windows.exe" && \
                git ls-tree -r origin/binaries | grep -q "version.txt"; then
-               echo "✅ Artifacts seem intact."
+               echo "✅ Artifacts intact."
                ARTIFACTS_OK="true"
             else
-               echo "⚠️ Branch exists but ARTIFACTS MISSING. Force rebuild."
+               echo "⚠️ Artifacts MISSING."
                ARTIFACTS_OK="false"
             fi
           else
-            echo "⚠️ Branch 'binaries' does NOT exist. First run detected."
+            echo "⚠️ Branch MISSING."
             ARTIFACTS_OK="false"
           fi
 
-          # --- 2. 检查 Commit Message 版本号 ---
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
-          REGEX="version\s+[0-9.]+\s+->\s+([0-9.]+)"
-          
           # --- 3. 综合决策逻辑 ---
           
+          SHOULD_BUILD="false"
+          FINAL_VER_TAG="$CURRENT_VER" # 默认使用提取到的具体版本号
+
           if [[ "$ARTIFACTS_OK" == "false" ]]; then
-            # 情况A: 分支不存在 或 文件缺失 -> 强制构建
-            echo "🚀 Integrity check failed. Initiating repair build."
+            echo "🚀 Repair trigger. Rebuilding version $CURRENT_VER..."
             SHOULD_BUILD="true"
-            ver_num="repair-build"
 
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # 情况B: 手动触发 -> 强制构建
-            echo "👆 Manual Trigger detected. Forcing build."
+            echo "👆 Manual trigger. Rebuilding version $CURRENT_VER..."
             SHOULD_BUILD="true"
-            ver_num="manual-build"
 
           elif [[ "$MSG" =~ $REGEX ]]; then
-            # 情况C: 发现原作者发版 -> 构建
-            NEW_VER="${BASH_REMATCH[1]}"
-            echo "🎉 New Version detected: $NEW_VER"
+            echo "🎉 New release trigger. Building version $CURRENT_VER..."
             SHOULD_BUILD="true"
-            ver_num="$NEW_VER"
             
           else
-            # 情况D: 完好无损且无更新 -> 跳过
-            echo "zzz Environment healthy & no update. Sleeping."
+            echo "zzz No update & System healthy. Version stays at $CURRENT_VER. Skipping."
             SHOULD_BUILD="false"
           fi
           
           # 输出结果
           echo "should_run=$SHOULD_BUILD" >> $GITHUB_OUTPUT
-          echo "version_num=$ver_num" >> $GITHUB_OUTPUT
+          echo "version_num=$FINAL_VER_TAG" >> $GITHUB_OUTPUT
 
   # ===================================================
   # 任务二：矩阵编译
@@ -150,7 +158,7 @@ jobs:
         path: dist/${{ matrix.final_name }}
 
   # ===================================================
-  # 任务三：双重部署 (修复了 git commit 报错)
+  # 任务三：双重部署
   # ===================================================
   deploy:
     needs: [check_condition, build]
@@ -162,12 +170,11 @@ jobs:
       uses: actions/checkout@v3
       
     - name: Prepare Files
-      # 使用环境变量来接收版本号，防止注入错误
       env:
         VERSION_TAG: ${{ needs.check_condition.outputs.version_num }}
       run: |
         zip -r master.zip . -x "*.git*" ".github*"
-        # 确保版本号不为空，如果为空则给默认值
+        # 使用 Shell 默认值，防止为空
         echo "${VERSION_TAG:-unknown}" > version.txt
 
     - name: Download Artifacts
@@ -183,12 +190,19 @@ jobs:
         GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         GITEE_REPO: ${{ secrets.GITEE_REPO }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # 再次引入版本号，供 git commit 使用
         VERSION_TAG: ${{ needs.check_condition.outputs.version_num }}
       run: |
+        # --- Git 核心配置 (修复 RPC failed) ---
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         
+        # 【关键修复】增加缓冲区大小到 500MB (524288000 bytes)
+        git config --global http.postBuffer 524288000
+        # 【辅助修复】增加底层传输的超时时间
+        git config --global http.lowSpeedLimit 0
+        git config --global http.lowSpeedTime 999999
+        
+        # --- 准备工作区 ---
         mkdir deploy_package
         cp artifacts/* deploy_package/
         cp master.zip deploy_package/
@@ -200,17 +214,16 @@ jobs:
         git checkout -b binaries
         git add .
         
-        # 【修复核心】使用 Shell 变量默认值语法 :-
-        # 如果 VERSION_TAG 为空，就使用 'auto-recovery' 作为消息
-        COMMIT_MSG="Deploy Build ${VERSION_TAG:-auto-recovery}"
-        echo "Committing with message: $COMMIT_MSG"
-        
+        COMMIT_MSG="Deploy Version ${VERSION_TAG:-auto-recovery}"
         git commit -m "$COMMIT_MSG"
         
-        # 推送 A: GitHub
+        # --- 推送逻辑 (增加重试机制) ---
         git remote add github_origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+        git remote add gitee_origin "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git"
+        
+        echo "🚀 Pushing to GitHub..."
         git push github_origin binaries --force
         
-        # 推送 B: Gitee
-        git remote add gitee_origin "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git"
+        echo "🚀 Pushing to Gitee..."
+        # Gitee 有时极其不稳定，这里其实也可以尝试手动重试，但通常加大 buffer 就能解决
         git push gitee_origin binaries --force
