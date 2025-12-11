@@ -1,4 +1,4 @@
-name: Sync to Gitee and Build EXE
+name: Build All Platforms and Sync to Gitee
 
 on:
   schedule:
@@ -8,76 +8,113 @@ on:
     branches: [ main, master ]
 
 jobs:
-  build-and-deploy:
-    runs-on: windows-latest
+  # ===================================================
+  # 第一阶段：矩阵编译 (同时构建 Win, Mac, Linux)
+  # ===================================================
+  build:
+    strategy:
+      matrix:
+        include:
+          # Windows 构建配置
+          - os: windows-latest
+            platform_name: windows
+            executable_name: JLC2KiCadLib.exe
+            final_name: JLC2KiCadLib_windows.exe
+          
+          # Linux 构建配置 (使用 20.04 保证兼容性)
+          - os: ubuntu-20.04
+            platform_name: linux
+            executable_name: JLC2KiCadLib
+            final_name: JLC2KiCadLib_linux
+
+          # macOS 构建配置
+          - os: macos-13  # 指定 Intel 架构，兼容性最好
+            platform_name: macos
+            executable_name: JLC2KiCadLib
+            final_name: JLC2KiCadLib_macos
+
+    runs-on: ${{ matrix.os }}
 
     steps:
-    # 1. 拉取代码
     - name: Checkout source
       uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
 
-    # 2. 设置 Python 环境
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
 
-    # 3. 安装依赖 & PyInstaller
-    # 【修正点1】不再依赖 requirements.txt，直接安装 requests 和 colorama，这样更稳健
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests colorama
-        pip install pyinstaller
+        pip install requests colorama pyinstaller
 
-    # 4. 执行打包 (生成 exe)
-    - name: Build EXE with PyInstaller
+    - name: Build with PyInstaller
       run: |
-        # 确保路径正确，通常脚本都在 JLC2KiCadLib 文件夹下
-        pyinstaller --onefile JLC2KiCadLib/JLC2KiCadLib.py --name JLC2KiCadLib.exe
+        # 统一构建命令
+        pyinstaller --onefile JLC2KiCadLib/JLC2KiCadLib.py --name ${{ matrix.executable_name }}
 
-    # 5. 验证 EXE 是否生成
-    - name: Check EXE
-      run: |
-        if (Test-Path dist/JLC2KiCadLib.exe) {
-            Write-Host "EXE Build Success!"
-        } else {
-            Write-Error "EXE Build Failed!"
-        }
-
-    # 6. 将 EXE 和 License 同步到 Gitee
-    - name: Push EXE to Gitee (Release Branch)
+    - name: Rename Output
       shell: bash
+      run: |
+        # 重命名文件以便区分平台
+        mv dist/${{ matrix.executable_name }} dist/${{ matrix.final_name }}
+
+    # 将编译好的文件上传到 GitHub 临时存储区
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.platform_name }}
+        path: dist/${{ matrix.final_name }}
+
+  # ===================================================
+  # 第二阶段：收集所有文件并推送到 Gitee
+  # ===================================================
+  deploy:
+    needs: build  # 必须等 build 阶段全部完成
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout for License
+      uses: actions/checkout@v3
+
+    # 下载刚才三个系统编译出来的文件
+    - name: Download All Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: build-*
+        merge-multiple: true # 把所有文件放在同一级目录下
+        path: ./artifacts
+
+    - name: Push to Gitee
       env:
         GITEE_USER: ${{ secrets.GITEE_USER }}
         GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         GITEE_REPO: ${{ secrets.GITEE_REPO }}
       run: |
-        # 配置 Git 用户信息
+        # 准备 Git 环境
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         
         # 克隆 Gitee 仓库
         git clone https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git gitee_repo
-        
         cd gitee_repo
         
-        # 【修正点2】修正了拼写错误 --orphan
-        # 切换到 binaries 分支，如果不存在则创建孤儿分支（无历史记录）
+        # 切换到 binaries 分支
         git checkout --orphan binaries || git checkout binaries
         
-        # 清理当前目录下的旧文件（如果有），确保只保留最新的 EXE
+        # 清空旧文件，放入新文件
         rm -rf *
         
-        # 复制新生成的 EXE 和 License
-        # 注意：../dist/ 是上一级目录的 dist 文件夹
-        # 注意：../LICENSE 是上一级目录（原仓库根目录）的 License 文件
-        cp ../dist/JLC2KiCadLib.exe .
+        # 把 GitHub 临时区下载的文件移过来
+        cp ../artifacts/* .
+        # 别忘了 License
         cp ../LICENSE .
         
-        # 提交并强制推送
-        git add JLC2KiCadLib.exe LICENSE
-        git commit -m "Update EXE and License from GitHub Actions $(date +'%Y-%m-%d')"
+        # 显示一下文件列表（调试用）
+        ls -la
+        
+        # 提交推送
+        git add .
+        git commit -m "Update binaries for All Platforms $(date +'%Y-%m-%d')"
         git push origin binaries --force
