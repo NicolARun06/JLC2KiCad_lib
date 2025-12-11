@@ -1,35 +1,85 @@
-name: Build All Platforms and Sync to Gitee
+name: Smart Build based on Commit Message
 
 on:
+  # 每天检查一次
   schedule:
     - cron: '0 0 * * *'
+  # 手动触发 (方便调试，手动触发默认会强制执行构建)
   workflow_dispatch:
+  # 当代码更新时
   push:
     branches: [ main, master ]
 
 jobs:
   # ===================================================
-  # 第一阶段：矩阵编译 (同时构建 Win, Mac-ARM, Linux)
+  # 任务一：看门人 (检查是否需要发版)
+  # ===================================================
+  check_version:
+    runs-on: ubuntu-latest
+    # 定义输出变量，供后续任务使用
+    outputs:
+      should_run: ${{ steps.analyze.outputs.should_run }}
+      version_num: ${{ steps.analyze.outputs.version_num }}
+    
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2 #以此获取足够的提交历史
+
+      - name: Analyze Commit Message
+        id: analyze
+        shell: bash
+        run: |
+          # 获取最近一次提交的信息
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+          
+          # 定义正则表达式：匹配 "version 1.0.35 -> 1.0.36" 这种格式
+          # 捕获组1 是旧版本，捕获组2 是新版本
+          REGEX="version\s+[0-9.]+\s+->\s+([0-9.]+)"
+          
+          # 判断逻辑
+          if [[ "$MSG" =~ $REGEX ]]; then
+            NEW_VER="${BASH_REMATCH[1]}"
+            echo "✅ Detect Release Version: $NEW_VER"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "version_num=$NEW_VER" >> $GITHUB_OUTPUT
+            
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # 如果是手动点击按钮触发，强制运行，版本号设为 manual
+            echo "⚠️ Manual Trigger detected. Forcing build."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "version_num=manual-build" >> $GITHUB_OUTPUT
+            
+          else
+            echo "🛑 No version change detected. Skipping build."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "version_num=none" >> $GITHUB_OUTPUT
+          fi
+
+  # ===================================================
+  # 任务二：矩阵编译 (依赖任务一的结果)
   # ===================================================
   build:
+    needs: check_version
+    # 【关键】只有当看门人说 true 时，或者手动触发时，才运行
+    if: needs.check_version.outputs.should_run == 'true'
+    
     strategy:
       matrix:
         include:
-          # Windows (x64)
           - os: windows-latest
             platform_name: windows
             executable_name: JLC2KiCadLib.exe
             final_name: JLC2KiCadLib_windows.exe
           
-          # Linux (x64) - 升级到 22.04 以获得更快的调度
-          - os: ubuntu-22.04   # <--- 修改这里，原为 ubuntu-20.04
+          - os: ubuntu-22.04
             platform_name: linux
             executable_name: JLC2KiCadLib
             final_name: JLC2KiCadLib_linux
 
-          # macOS (ARM64 / Apple Silicon)
-          # GitHub Actions 的 macos-15 运行在 ARM64 架构上
-          - os: macos-15
+          - os: macos-15 # ARM64
             platform_name: macos_arm64
             executable_name: JLC2KiCadLib
             final_name: JLC2KiCadLib_macos_arm64
@@ -52,16 +102,13 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        # PyInstaller 会自动检测当前系统架构 (Win=x64, Mac=ARM64)
         pyinstaller --onefile JLC2KiCadLib/JLC2KiCadLib.py --name ${{ matrix.executable_name }}
 
     - name: Rename Output
       shell: bash
       run: |
-        # 重命名文件以便区分平台
         mv dist/${{ matrix.executable_name }} dist/${{ matrix.final_name }}
 
-    # 上传编译好的文件到 GitHub 临时区
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -69,17 +116,31 @@ jobs:
         path: dist/${{ matrix.final_name }}
 
   # ===================================================
-  # 第二阶段：收集所有文件并推送到 Gitee
+  # 任务三：打包源码并推送 Gitee
   # ===================================================
   deploy:
-    needs: build
+    needs: [check_version, build]
+    if: needs.check_version.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout for License
+    - name: Checkout Source for Zip
       uses: actions/checkout@v3
+      
+    # 1. 生成 master.zip 源码包
+    - name: Create Source Zip
+      run: |
+        # zip 命令打包当前目录，排除 .git 文件夹
+        zip -r master.zip . -x "*.git*" ".github*"
 
-    # 下载刚才三个系统编译出来的文件
+    # 2. 生成 version.txt
+    - name: Create Version File
+      run: |
+        # 从任务一的输出中获取版本号
+        echo "${{ needs.check_version.outputs.version_num }}" > version.txt
+        echo "Version file created: $(cat version.txt)"
+
+    # 3. 下载二进制文件
     - name: Download All Artifacts
       uses: actions/download-artifact@v4
       with:
@@ -87,6 +148,7 @@ jobs:
         merge-multiple: true
         path: ./artifacts
 
+    # 4. 推送到 Gitee
     - name: Push to Gitee
       env:
         GITEE_USER: ${{ secrets.GITEE_USER }}
@@ -96,21 +158,20 @@ jobs:
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         
-        # 克隆 Gitee 仓库
         git clone https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git gitee_repo
         cd gitee_repo
         
-        # 切换到 binaries 分支
         git checkout --orphan binaries || git checkout binaries
-        
-        # 清空旧文件
         rm -rf *
         
-        # 复制新文件 (Win, Linux, Mac-ARM)
-        cp ../artifacts/* .
-        cp ../LICENSE .
+        # 复制所有文件到仓库根目录
+        cp ../artifacts/* .      # 三个二进制文件
+        cp ../master.zip .       # 源码压缩包
+        cp ../version.txt .      # 版本号文件
+        cp ../LICENSE .          # 许可证
         
-        # 提交推送
+        ls -la
+        
         git add .
-        git commit -m "Update binaries (Win/Linux/Mac-ARM) $(date +'%Y-%m-%d')"
+        git commit -m "Auto-Deploy Version ${{ needs.check_version.outputs.version_num }}"
         git push origin binaries --force
