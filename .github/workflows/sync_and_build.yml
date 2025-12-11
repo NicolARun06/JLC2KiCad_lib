@@ -74,10 +74,11 @@ jobs:
         
         # 把刚才生成的 exe 复制过来
         cp ../dist/JLC2KiCadLib.exe .
+        cp ../LICENSE .   <-- 确保原仓库根目录的 LICENSE 文件也被拷过来
         
         # 提交并推送
-        git add JLC2KiCadLib.exe
-        git commit -m "Update EXE from GitHub Actions build $(date +'%Y-%m-%d')"
+        git add JLC2KiCadLib.exe LICENSE
+        git commit -m "Update EXE and License $(date +'%Y-%m-%d')"
         git push origin binaries --force
 
     # 7. (可选) 同步源代码到 Gitee 的 master 分支
