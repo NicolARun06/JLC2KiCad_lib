@@ -21,8 +21,8 @@ jobs:
             executable_name: JLC2KiCadLib.exe
             final_name: JLC2KiCadLib_windows.exe
           
-          # Linux (x64) - 使用较旧版本以保证兼容性
-          - os: ubuntu-20.04
+          # Linux (x64) - 升级到 22.04 以获得更快的调度
+          - os: ubuntu-22.04   # <--- 修改这里，原为 ubuntu-20.04
             platform_name: linux
             executable_name: JLC2KiCadLib
             final_name: JLC2KiCadLib_linux
