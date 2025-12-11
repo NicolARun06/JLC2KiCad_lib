@@ -9,29 +9,30 @@ on:
 
 jobs:
   # ===================================================
-  # 第一阶段：矩阵编译 (同时构建 Win, Mac, Linux)
+  # 第一阶段：矩阵编译 (同时构建 Win, Mac-ARM, Linux)
   # ===================================================
   build:
     strategy:
       matrix:
         include:
-          # Windows 构建配置
+          # Windows (x64)
           - os: windows-latest
             platform_name: windows
             executable_name: JLC2KiCadLib.exe
             final_name: JLC2KiCadLib_windows.exe
           
-          # Linux 构建配置 (使用 20.04 保证兼容性)
+          # Linux (x64) - 使用较旧版本以保证兼容性
           - os: ubuntu-20.04
             platform_name: linux
             executable_name: JLC2KiCadLib
             final_name: JLC2KiCadLib_linux
 
-          # macOS 构建配置
-          - os: macos-13  # 指定 Intel 架构，兼容性最好
-            platform_name: macos
+          # macOS (ARM64 / Apple Silicon)
+          # GitHub Actions 的 macos-15 运行在 ARM64 架构上
+          - os: macos-15
+            platform_name: macos_arm64
             executable_name: JLC2KiCadLib
-            final_name: JLC2KiCadLib_macos
+            final_name: JLC2KiCadLib_macos_arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -51,7 +52,7 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        # 统一构建命令
+        # PyInstaller 会自动检测当前系统架构 (Win=x64, Mac=ARM64)
         pyinstaller --onefile JLC2KiCadLib/JLC2KiCadLib.py --name ${{ matrix.executable_name }}
 
     - name: Rename Output
@@ -60,7 +61,7 @@ jobs:
         # 重命名文件以便区分平台
         mv dist/${{ matrix.executable_name }} dist/${{ matrix.final_name }}
 
-    # 将编译好的文件上传到 GitHub 临时存储区
+    # 上传编译好的文件到 GitHub 临时区
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -71,7 +72,7 @@ jobs:
   # 第二阶段：收集所有文件并推送到 Gitee
   # ===================================================
   deploy:
-    needs: build  # 必须等 build 阶段全部完成
+    needs: build
     runs-on: ubuntu-latest
     
     steps:
@@ -83,7 +84,7 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         pattern: build-*
-        merge-multiple: true # 把所有文件放在同一级目录下
+        merge-multiple: true
         path: ./artifacts
 
     - name: Push to Gitee
@@ -92,7 +93,6 @@ jobs:
         GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         GITEE_REPO: ${{ secrets.GITEE_REPO }}
       run: |
-        # 准备 Git 环境
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         
@@ -103,18 +103,14 @@ jobs:
         # 切换到 binaries 分支
         git checkout --orphan binaries || git checkout binaries
         
-        # 清空旧文件，放入新文件
+        # 清空旧文件
         rm -rf *
         
-        # 把 GitHub 临时区下载的文件移过来
+        # 复制新文件 (Win, Linux, Mac-ARM)
         cp ../artifacts/* .
-        # 别忘了 License
         cp ../LICENSE .
-        
-        # 显示一下文件列表（调试用）
-        ls -la
         
         # 提交推送
         git add .
-        git commit -m "Update binaries for All Platforms $(date +'%Y-%m-%d')"
+        git commit -m "Update binaries (Win/Linux/Mac-ARM) $(date +'%Y-%m-%d')"
         git push origin binaries --force
