@@ -1,6 +1,6 @@
-name: Auto Build & Sync (GitHub + Gitee)
+name: Auto Build & Sync (Robust Version)
 
-# 授予写权限，以便脚本能向你的 GitHub 仓库推送 binaries 分支
+# 授予写权限
 permissions:
   contents: write
 
@@ -13,7 +13,7 @@ on:
 
 jobs:
   # ===================================================
-  # 任务一：看门人 (智能判断是否需要构建)
+  # 任务一：看门人 (智能判断 + 完整性检查)
   # ===================================================
   check_condition:
     runs-on: ubuntu-latest
@@ -25,20 +25,36 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0 # 获取完整历史以便检查分支
+          fetch-depth: 0 
 
       - name: Analyze Condition
         id: analyze
         shell: bash
         run: |
-          # --- 1. 检查 GitHub 远程是否存在 binaries 分支 ---
-          # 如果 git ls-remote 返回空，说明分支不存在，这是首次运行
-          if git ls-remote --exit-code --heads origin binaries; then
-            echo "✅ GitHub 'binaries' branch exists."
-            BRANCH_EXISTS="true"
+          # 初始化默认状态
+          SHOULD_BUILD="false"
+          ver_num="none"
+
+          # --- 1. 检查 GitHub 远程分支及文件完整性 ---
+          echo "🔍 Checking remote branch status..."
+          
+          # 尝试获取 binaries 分支的信息
+          if git fetch origin binaries; then
+            echo "✅ Branch 'binaries' exists."
+            
+            # 检查关键文件是否存在 (JLC2KiCadLib_windows.exe 和 version.txt)
+            # git ls-tree 可以不切换分支直接查看内容
+            if git ls-tree -r origin/binaries | grep -q "JLC2KiCadLib_windows.exe" && \
+               git ls-tree -r origin/binaries | grep -q "version.txt"; then
+               echo "✅ Artifacts seem intact."
+               ARTIFACTS_OK="true"
+            else
+               echo "⚠️ Branch exists but ARTIFACTS MISSING. Force rebuild."
+               ARTIFACTS_OK="false"
+            fi
           else
-            echo "⚠️ GitHub 'binaries' branch MISSING. First run detected!"
-            BRANCH_EXISTS="false"
+            echo "⚠️ Branch 'binaries' does NOT exist. First run detected."
+            ARTIFACTS_OK="false"
           fi
 
           # --- 2. 检查 Commit Message 版本号 ---
@@ -46,36 +62,39 @@ jobs:
           echo "Commit message: $MSG"
           REGEX="version\s+[0-9.]+\s+->\s+([0-9.]+)"
           
-          # --- 3. 综合判断逻辑 ---
+          # --- 3. 综合决策逻辑 ---
           
-          if [[ "$BRANCH_EXISTS" == "false" ]]; then
-            # 情况A: 首次运行 (分支不存在)，强制构建
-            echo "🚀 First run logic triggered. Forcing build."
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "version_num=init-build" >> $GITHUB_OUTPUT
+          if [[ "$ARTIFACTS_OK" == "false" ]]; then
+            # 情况A: 分支不存在 或 文件缺失 -> 强制构建
+            echo "🚀 Integrity check failed. Initiating repair build."
+            SHOULD_BUILD="true"
+            ver_num="repair-build"
 
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # 情况B: 手动触发，强制构建
+            # 情况B: 手动触发 -> 强制构建
             echo "👆 Manual Trigger detected. Forcing build."
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "version_num=manual-build" >> $GITHUB_OUTPUT
+            SHOULD_BUILD="true"
+            ver_num="manual-build"
 
           elif [[ "$MSG" =~ $REGEX ]]; then
-            # 情况C: 发现原作者发版 (正则匹配成功)
+            # 情况C: 发现原作者发版 -> 构建
             NEW_VER="${BASH_REMATCH[1]}"
             echo "🎉 New Version detected: $NEW_VER"
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "version_num=$NEW_VER" >> $GITHUB_OUTPUT
+            SHOULD_BUILD="true"
+            ver_num="$NEW_VER"
             
           else
-            # 情况D: 无事发生，跳过
-            echo "zzz No version change & branch exists. Sleeping."
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "version_num=none" >> $GITHUB_OUTPUT
+            # 情况D: 完好无损且无更新 -> 跳过
+            echo "zzz Environment healthy & no update. Sleeping."
+            SHOULD_BUILD="false"
           fi
+          
+          # 输出结果
+          echo "should_run=$SHOULD_BUILD" >> $GITHUB_OUTPUT
+          echo "version_num=$ver_num" >> $GITHUB_OUTPUT
 
   # ===================================================
-  # 任务二：矩阵编译 (Win, Linux, Mac-ARM)
+  # 任务二：矩阵编译
   # ===================================================
   build:
     needs: check_condition
@@ -131,7 +150,7 @@ jobs:
         path: dist/${{ matrix.final_name }}
 
   # ===================================================
-  # 任务三：双重部署 (GitHub + Gitee)
+  # 任务三：双重部署 (修复了 git commit 报错)
   # ===================================================
   deploy:
     needs: [check_condition, build]
@@ -142,15 +161,15 @@ jobs:
     - name: Checkout Source for Zip
       uses: actions/checkout@v3
       
-    # 1. 准备发布文件
     - name: Prepare Files
+      # 使用环境变量来接收版本号，防止注入错误
+      env:
+        VERSION_TAG: ${{ needs.check_condition.outputs.version_num }}
       run: |
-        # 打包源码
         zip -r master.zip . -x "*.git*" ".github*"
-        # 生成版本文件
-        echo "${{ needs.check_condition.outputs.version_num }}" > version.txt
+        # 确保版本号不为空，如果为空则给默认值
+        echo "${VERSION_TAG:-unknown}" > version.txt
 
-    # 2. 下载所有编译产物
     - name: Download Artifacts
       uses: actions/download-artifact@v4
       with:
@@ -158,22 +177,18 @@ jobs:
         merge-multiple: true
         path: ./artifacts
 
-    # 3. 部署核心逻辑
     - name: Push to Remotes
       env:
-        # Gitee 密钥
         GITEE_USER: ${{ secrets.GITEE_USER }}
         GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         GITEE_REPO: ${{ secrets.GITEE_REPO }}
-        # GitHub 自动令牌
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # 再次引入版本号，供 git commit 使用
+        VERSION_TAG: ${{ needs.check_condition.outputs.version_num }}
       run: |
-        # 配置 Git
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         
-        # --- 准备工作区 ---
-        # 创建一个临时目录来存放我们要发布的所有文件
         mkdir deploy_package
         cp artifacts/* deploy_package/
         cp master.zip deploy_package/
@@ -184,4 +199,18 @@ jobs:
         git init
         git checkout -b binaries
         git add .
-        git commit -m
+        
+        # 【修复核心】使用 Shell 变量默认值语法 :-
+        # 如果 VERSION_TAG 为空，就使用 'auto-recovery' 作为消息
+        COMMIT_MSG="Deploy Build ${VERSION_TAG:-auto-recovery}"
+        echo "Committing with message: $COMMIT_MSG"
+        
+        git commit -m "$COMMIT_MSG"
+        
+        # 推送 A: GitHub
+        git remote add github_origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+        git push github_origin binaries --force
+        
+        # 推送 B: Gitee
+        git remote add gitee_origin "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git"
+        git push gitee_origin binaries --force
