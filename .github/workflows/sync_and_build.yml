@@ -1,0 +1,94 @@
+name: Sync to Gitee and Build EXE
+
+on:
+  # 两种触发方式：
+  # 1. 每天检查一次上游是否有更新
+  schedule:
+    - cron: '0 0 * * *'
+  # 2. 手动点击按钮触发 (方便你测试)
+  workflow_dispatch:
+  # 3. 当你推送到 main 分支时触发
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-and-deploy:
+    runs-on: windows-latest  # 关键：使用 Windows 环境构建 EXE
+
+    steps:
+    # 1. 拉取代码
+    - name: Checkout source
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    # 2. 设置 Python 环境
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    # 3. 安装依赖 & PyInstaller
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    # 4. 执行打包 (生成 exe)
+    - name: Build EXE with PyInstaller
+      run: |
+        # --onefile 表示单文件, --noconsole 表示不显示黑框(可选)
+        pyinstaller --onefile JLC2KiCadLib/JLC2KiCadLib.py --name JLC2KiCadLib.exe
+
+    # 5. 验证 EXE 是否生成
+    - name: Check EXE
+      run: |
+        if (Test-Path dist/JLC2KiCadLib.exe) {
+            Write-Host "EXE Build Success!"
+        } else {
+            Write-Error "EXE Build Failed!"
+        }
+
+    # 6. 【核心步骤】将 EXE 和代码同步到 Gitee
+    # 策略：我们将 exe 放在一个专门的 orphan 分支，方便 uTools 下载
+    - name: Push EXE to Gitee (Release Branch)
+      shell: bash
+      env:
+        GITEE_USER: ${{ secrets.GITEE_USER }}
+        GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        GITEE_REPO: ${{ secrets.GITEE_REPO }}
+      run: |
+        # 配置 Git
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        
+        # 克隆 Gitee 仓库
+        git clone https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git gitee_repo
+        
+        cd gitee_repo
+        
+        # 切换到一个专门存放二进制文件的分支，比如 'binaries'
+        # 如果不存在则创建孤儿分支（没有历史记录，保持体积小）
+        git checkout --orchephan binaries || git checkout binaries
+        
+        # 把刚才生成的 exe 复制过来
+        cp ../dist/JLC2KiCadLib.exe .
+        
+        # 提交并推送
+        git add JLC2KiCadLib.exe
+        git commit -m "Update EXE from GitHub Actions build $(date +'%Y-%m-%d')"
+        git push origin binaries --force
+
+    # 7. (可选) 同步源代码到 Gitee 的 master 分支
+    # 如果你还需要 Gitee 上有源码，可以使用 hub-mirror-action 插件
+    # 或者简单粗暴地 push
+    # - name: Sync Source Code to Gitee
+    #  uses: Yikun/hub-mirror-action@v1.3
+    #  with:
+    #    src: github/YOUR_GITHUB_USER_NAME  # 改成你的 GitHub 用户名
+    #    dst: gitee/${{ secrets.GITEE_USER }}
+    #    dst_key: ${{ secrets.GITEE_TOKEN }} # 这里其实推荐用 SSH Key，Token 也可以但要配置
+    #    dst_token: ${{ secrets.GITEE_TOKEN }}
+    #    static_list: "JLC2KiCad_lib" # 改成你的 GitHub 仓库名
+    #    force_update: true
