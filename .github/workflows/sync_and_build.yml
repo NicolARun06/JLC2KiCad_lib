@@ -1,4 +1,4 @@
-name: Auto Build & Sync (Strict Versioning)
+name: Auto Build & Sync (Fix Relative Import)
 
 permissions:
   contents: write
@@ -12,7 +12,7 @@ on:
 
 jobs:
   # ===================================================
-  # 任务一：看门人 (历史版本回溯 + 完整性检查)
+  # 任务一：看门人 (保持不变)
   # ===================================================
   check_condition:
     runs-on: ubuntu-latest
@@ -24,85 +24,56 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v3
         with:
-          fetch-depth: 100 # 【关键】拉取足够深的历史，以便回溯版本号
+          fetch-depth: 100
 
       - name: Analyze Condition
         id: analyze
         shell: bash
         run: |
-          # --- 函数：从历史记录中提取最近的版本号 ---
           function get_last_version() {
-            # 在最近 100 条提交中搜索符合 "version X -> Y" 格式的记录
-            # grep 提取版本号 Y
             local ver=$(git log -n 100 --pretty=%B | grep -oP "version\s+[0-9.]+\s+->\s+\K[0-9.]+" | head -n 1)
-            
-            if [[ -z "$ver" ]]; then
-              echo "0.0.0" # 兜底，如果实在找不到
-            else
-              echo "$ver"
-            fi
+            if [[ -z "$ver" ]]; then echo "0.0.0"; else echo "$ver"; fi
           }
 
-          # --- 1. 获取基准版本号 (无论如何都要有一个版本号) ---
           MSG=$(git log -1 --pretty=%B)
-          echo "Current Commit: $MSG"
           REGEX="version\s+[0-9.]+\s+->\s+([0-9.]+)"
           
           if [[ "$MSG" =~ $REGEX ]]; then
-             # 如果当前提交就是发版，直接用
              CURRENT_VER="${BASH_REMATCH[1]}"
-             echo "🎯 Detected NEW release in current commit: $CURRENT_VER"
           else
-             # 如果当前不是发版，回溯历史找最近的一个
              CURRENT_VER=$(get_last_version)
-             echo "🔙 Traceback found last version: $CURRENT_VER"
           fi
 
-          # --- 2. 检查 GitHub 远程分支及文件完整性 ---
-          echo "🔍 Checking remote branch status..."
-          
+          echo "🔍 Checking artifacts status..."
           if git fetch origin binaries; then
             if git ls-tree -r origin/binaries | grep -q "JLC2KiCadLib_windows.exe" && \
                git ls-tree -r origin/binaries | grep -q "version.txt"; then
-               echo "✅ Artifacts intact."
                ARTIFACTS_OK="true"
             else
-               echo "⚠️ Artifacts MISSING."
                ARTIFACTS_OK="false"
             fi
           else
-            echo "⚠️ Branch MISSING."
             ARTIFACTS_OK="false"
           fi
 
-          # --- 3. 综合决策逻辑 ---
-          
           SHOULD_BUILD="false"
-          FINAL_VER_TAG="$CURRENT_VER" # 默认使用提取到的具体版本号
+          FINAL_VER_TAG="$CURRENT_VER"
 
           if [[ "$ARTIFACTS_OK" == "false" ]]; then
-            echo "🚀 Repair trigger. Rebuilding version $CURRENT_VER..."
             SHOULD_BUILD="true"
-
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "👆 Manual trigger. Rebuilding version $CURRENT_VER..."
             SHOULD_BUILD="true"
-
           elif [[ "$MSG" =~ $REGEX ]]; then
-            echo "🎉 New release trigger. Building version $CURRENT_VER..."
             SHOULD_BUILD="true"
-            
           else
-            echo "zzz No update & System healthy. Version stays at $CURRENT_VER. Skipping."
             SHOULD_BUILD="false"
           fi
           
-          # 输出结果
           echo "should_run=$SHOULD_BUILD" >> $GITHUB_OUTPUT
           echo "version_num=$FINAL_VER_TAG" >> $GITHUB_OUTPUT
 
   # ===================================================
-  # 任务二：矩阵编译
+  # 任务二：矩阵编译 (核心修改点)
   # ===================================================
   build:
     needs: check_condition
@@ -137,14 +108,34 @@ jobs:
       with:
         python-version: '3.9'
 
+    # 【修改点 1】安装依赖
+    # 使用 pip install . 安装当前包，解决包结构识别问题
+    # 同时显式安装 pyinstaller, requests, colorama 以防万一
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests colorama pyinstaller
+        pip install . requests colorama pyinstaller
 
+    # 【修改点 2】动态生成入口文件并编译
+    # 使用 bash 的 heredoc 语法生成临时脚本
+    # 强制让 PyInstaller 通过绝对导入调用包
     - name: Build with PyInstaller
+      shell: bash
       run: |
-        pyinstaller --onefile JLC2KiCadLib/JLC2KiCadLib.py --name ${{ matrix.executable_name }}
+        # 1. 动态生成入口脚本
+        cat > entry_for_pyinstaller.py << 'EOF'
+        from JLC2KiCadLib.JLC2KiCadLib import main
+
+        if __name__ == "__main__":
+            main()
+        EOF
+
+        # 2. 打印一下看是否生成成功 (调试用)
+        cat entry_for_pyinstaller.py
+
+        # 3. 对这个临时脚本进行打包
+        # 注意：这里不需要再指定路径了，因为就在当前目录下
+        pyinstaller --onefile entry_for_pyinstaller.py --name ${{ matrix.executable_name }}
 
     - name: Rename Output
       shell: bash
@@ -158,7 +149,7 @@ jobs:
         path: dist/${{ matrix.final_name }}
 
   # ===================================================
-  # 任务三：双重部署
+  # 任务三：双重部署 (保持不变)
   # ===================================================
   deploy:
     needs: [check_condition, build]
@@ -174,7 +165,6 @@ jobs:
         VERSION_TAG: ${{ needs.check_condition.outputs.version_num }}
       run: |
         zip -r master.zip . -x "*.git*" ".github*"
-        # 使用 Shell 默认值，防止为空
         echo "${VERSION_TAG:-unknown}" > version.txt
 
     - name: Download Artifacts
@@ -192,17 +182,14 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         VERSION_TAG: ${{ needs.check_condition.outputs.version_num }}
       run: |
-        # --- Git 核心配置 (修复 RPC failed) ---
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
         
-        # 【关键修复】增加缓冲区大小到 500MB (524288000 bytes)
+        # 增大缓冲区，防止RPC failed
         git config --global http.postBuffer 524288000
-        # 【辅助修复】增加底层传输的超时时间
-        git config --global http.lowSpeedLimit 0
-        git config --global http.lowSpeedTime 999999
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 600
         
-        # --- 准备工作区 ---
         mkdir deploy_package
         cp artifacts/* deploy_package/
         cp master.zip deploy_package/
@@ -217,13 +204,12 @@ jobs:
         COMMIT_MSG="Deploy Version ${VERSION_TAG:-auto-recovery}"
         git commit -m "$COMMIT_MSG"
         
-        # --- 推送逻辑 (增加重试机制) ---
+        # 1. GitHub Push
         git remote add github_origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-        git remote add gitee_origin "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git"
-        
         echo "🚀 Pushing to GitHub..."
         git push github_origin binaries --force
         
+        # 2. Gitee Push
+        git remote add gitee_origin "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_USER}/${GITEE_REPO}.git"
         echo "🚀 Pushing to Gitee..."
-        # Gitee 有时极其不稳定，这里其实也可以尝试手动重试，但通常加大 buffer 就能解决
         git push gitee_origin binaries --force
